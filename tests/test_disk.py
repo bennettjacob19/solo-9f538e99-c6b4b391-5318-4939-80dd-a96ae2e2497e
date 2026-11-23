@@ -6,20 +6,26 @@
 3. 并发写入竞争：判零之后写入非零数据，回收不得抹掉新数据
 4. 中断重跑：中断后原盘与已打的洞保留，重启可重新发起并继续回收
 5. API 层输入校验与路由行为（stdlib WSGI 入口）
+6. 启动流程：容量不符报错停启并保留原盘、强杀后清残留重建、
+   多进程/多线程共用空卷串行建盘（卷上预置数据最多一份）
 """
 from __future__ import annotations
 
+import fcntl
+import glob
 import io
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
 
 from app.api import ApiCore, ApiError
 from app.constants import BLOCK_SIZE, STATE_DATA, STATE_HOLE, STATE_ZERO
-from app.disk import DiskImage, create_image
+from app.disk import DiskImage, ImageCapacityMismatchError, create_image
 from app.reclaim import ReclaimManager
 from app.server_stdlib import create_wsgi_app
 
@@ -328,6 +334,155 @@ class TestInterruptionAndRestart(TempImageTestCase):
             self.assertEqual(again.actual_bytes(), 4 * BLOCK_SIZE)
         finally:
             again.close()
+
+
+class TestStartupFlow(TempImageTestCase):
+    """镜像启动流程：复用 / 容量不符停启 / 原子建盘 / 并发串行 / 残留清理。"""
+
+    def test_capacity_mismatch_reports_and_preserves_disk(self):
+        """运维改 BLOCK_COUNT 重启：报错含盘上/配置容量，原盘内容与空洞不动。"""
+        disk = create_image(self.path, 16)
+        # 制造盘上状态：写一个非零块、回收打出一些洞
+        disk.write_block(0, b"\x01" * BLOCK_SIZE)
+        list(disk.reclaim())
+        disk.close()
+        size_before = os.path.getsize(self.path)
+        blocks_before = os.stat(self.path).st_blocks
+        with open(self.path, "rb") as fh:
+            content_before = fh.read()
+
+        with self.assertRaises(ImageCapacityMismatchError) as ctx:
+            create_image(self.path, 32)  # 运维把 16 改成了 32
+        exc = ctx.exception
+        # 异常携带盘上容量与配置容量，文案中也能看到
+        self.assertEqual(exc.disk_bytes, 16 * BLOCK_SIZE)
+        self.assertEqual(exc.configured_bytes, 32 * BLOCK_SIZE)
+        self.assertEqual(exc.configured_blocks, 32)
+        msg = str(exc)
+        self.assertIn(str(16 * BLOCK_SIZE), msg)
+        self.assertIn(str(32 * BLOCK_SIZE), msg)
+        self.assertIn("32", msg)
+
+        # 原盘内容与空洞（实占）原样保留
+        self.assertEqual(os.path.getsize(self.path), size_before)
+        self.assertEqual(os.stat(self.path).st_blocks, blocks_before)
+        with open(self.path, "rb") as fh:
+            self.assertEqual(fh.read(), content_before)
+
+        # 配置改回相符值后可正常复用启动
+        again = create_image(self.path, 16)
+        again.close()
+
+    def test_killed_builder_residue_cleaned_and_rebuilt(self):
+        """建盘进程被强杀：只留下临时文件，重启清残留并建好完整的盘。"""
+        stale = f"{self.path}.build.9999"
+        fd = os.open(stale, os.O_CREAT | os.O_RDWR, 0o644)
+        # 模拟建到一半被杀：只 ftruncate 出容量，预置数据还没写
+        os.ftruncate(fd, 16 * BLOCK_SIZE)
+        os.close(fd)
+        self.assertFalse(os.path.exists(self.path))
+
+        disk = create_image(self.path, 16)
+        try:
+            # 残留临时文件被清理，正式镜像布局完整（不是半盘）
+            self.assertFalse(os.path.exists(stale))
+            self.assertEqual(glob.glob(f"{self.path}.build.*"), [])
+            self.assertEqual(disk.block_state(4), STATE_ZERO)
+            self.assertEqual(disk.block_state(8), STATE_DATA)
+            self.assertEqual(disk.block_state(0), STATE_HOLE)
+            self.assertEqual(disk.actual_bytes(), 8 * BLOCK_SIZE)
+        finally:
+            disk.close()
+
+    def test_concurrent_create_on_empty_volume_single_copy(self):
+        """空卷上多个线程（模拟多进程）同时建盘：全部成功，卷上只有一份预置数据。"""
+        results, errors = [], []
+
+        def worker():
+            try:
+                results.append(create_image(self.path, 16))
+            except Exception as exc:  # pragma: no cover - 失败即测试失败
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(len(results), 8)
+        for d in results:
+            d.close()
+
+        # 无临时文件残留；实占恰为一份预置布局（4 零块 + 4 非零块）
+        self.assertEqual(glob.glob(f"{self.path}.build.*"), [])
+        disk = create_image(self.path, 16)
+        try:
+            self.assertEqual(disk.actual_bytes(), 8 * BLOCK_SIZE)
+            self.assertEqual(disk.block_state(4), STATE_ZERO)
+            self.assertEqual(disk.block_state(8), STATE_DATA)
+        finally:
+            disk.close()
+
+    def test_second_builder_waits_for_lock_no_partial_image(self):
+        """另一个进程持锁建盘期间：本进程阻塞等待，正式镜像与临时文件都不出现。"""
+        lock_fd = os.open(f"{self.path}.lock", os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # 模拟他进程正在建盘
+        done = threading.Event()
+        holder = {}
+
+        def builder():
+            holder["disk"] = create_image(self.path, 16)
+            done.set()
+
+        t = threading.Thread(target=builder)
+        t.start()
+        try:
+            # 锁被占用期间建盘不会开始：卷上看不到任何预置数据
+            self.assertFalse(done.wait(0.3))
+            self.assertFalse(os.path.exists(self.path))
+            self.assertEqual(glob.glob(f"{self.path}.build.*"), [])
+        finally:
+            os.close(lock_fd)  # 释放锁 → 等待中的建盘继续并完成
+        self.assertTrue(done.wait(5))
+        t.join()
+        holder["disk"].close()
+        # 布局完整后落盘，可正常复用
+        disk = create_image(self.path, 16)
+        try:
+            self.assertEqual(disk.block_state(4), STATE_ZERO)
+            self.assertEqual(disk.block_state(8), STATE_DATA)
+        finally:
+            disk.close()
+
+    def _run_cli(self, extra_env):
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env = dict(os.environ, IMAGE_PATH=self.path, **extra_env)
+        return subprocess.run(
+            [sys.executable, "-m", "app.cli", "init-image"],
+            cwd=repo_root, env=env, capture_output=True, text=True, timeout=60,
+        )
+
+    def test_cli_init_image_mismatch_stops_startup(self):
+        """CLI：容量不符时非零退出、stderr 报告盘上/配置容量、原盘不动。"""
+        create_image(self.path, 16).close()
+        size_before = os.path.getsize(self.path)
+
+        proc = self._run_cli({"BLOCK_COUNT": "64"})
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn(str(16 * BLOCK_SIZE), proc.stderr)   # 盘上容量
+        self.assertIn(str(64 * BLOCK_SIZE), proc.stderr)   # 配置容量
+        self.assertIn("BLOCK_COUNT=64", proc.stderr)
+        self.assertEqual(os.path.getsize(self.path), size_before)
+
+    def test_cli_init_image_idempotent_success(self):
+        """CLI：空卷建盘成功；再次运行（容量相符）复用成功，退出码均为 0。"""
+        proc = self._run_cli({"BLOCK_COUNT": "16"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(os.path.exists(self.path))
+        proc2 = self._run_cli({"BLOCK_COUNT": "16"})
+        self.assertEqual(proc2.returncode, 0, proc2.stderr)
+        self.assertEqual(glob.glob(f"{self.path}.build.*"), [])
 
 
 class TestApiCore(TempImageTestCase):

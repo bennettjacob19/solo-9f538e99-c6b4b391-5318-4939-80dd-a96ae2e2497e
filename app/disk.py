@@ -13,11 +13,16 @@
 * 每个 4KiB 块有一把锁：打洞前在锁内再次校验该块仍为全零，
   与并发写互斥。判零之后若该块被写入非零数据，重检会失败、跳过打洞，
   新数据绝不会被抹掉。
+* 启动建盘（``create_image``）走 flock 串行 + 临时文件原子 rename：
+  容量相符的已有盘原样复用，容量不符报错停启并保留原盘，
+  建到一半被强杀不会留下"半盘"，重启清理残留后重建。
 """
 from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import fcntl
+import glob
 import os
 import threading
 from typing import Iterator, Optional
@@ -214,10 +219,42 @@ class DiskImage:
 # ---------------------------------------------------------------------------
 # 预置镜像
 # ---------------------------------------------------------------------------
-def create_image(path: str, block_count: int = DEFAULT_BLOCK_COUNT) -> DiskImage:
-    """创建（或打开已有的）预置 raw 镜像。
+class ImageCapacityMismatchError(RuntimeError):
+    """已有镜像容量与 BLOCK_COUNT 配置不一致。
 
-    预置布局（256 块时）::
+    携带盘上容量与配置容量供调用方报告；抛出时原盘内容与空洞保持原样，
+    启动流程应当就此停止。
+    """
+
+    def __init__(self, path: str, disk_bytes: int, configured_blocks: int):
+        self.path = path
+        self.disk_bytes = disk_bytes
+        self.configured_blocks = configured_blocks
+        self.configured_bytes = configured_blocks * BLOCK_SIZE
+        disk_desc = (
+            f"{disk_bytes // BLOCK_SIZE} 个 4KiB 块"
+            if disk_bytes % BLOCK_SIZE == 0
+            else "非整块容量"
+        )
+        super().__init__(
+            f"镜像容量不符，已停止启动（原盘内容与空洞保留不动）: "
+            f"{path} 盘上容量 {disk_bytes} B（{disk_desc}）"
+            f" != 配置容量 {self.configured_bytes} B（BLOCK_COUNT={configured_blocks}）。"
+            f"请修正 BLOCK_COUNT 或更换 IMAGE_PATH / 数据卷后重启。"
+        )
+
+
+def _clean_stale_build_files(path: str) -> None:
+    """删除被强杀的建盘进程留下的临时文件。调用方必须已持有建盘锁。"""
+    for stale in glob.glob(f"{path}.build.*"):
+        try:
+            os.remove(stale)
+        except OSError:
+            pass  # 残留清不掉不阻塞启动；后续建盘若真有问题会另行报错
+
+
+def _write_preset_layout(fd: int, block_count: int) -> None:
+    """向 fd 写入完整预置布局并 fsync（256 块时）::
 
         块 0..63    空洞（ftruncate 产生，不占宿主空间）
         块 64..127  写过的全零块（已分配、占空间、可回收）
@@ -225,28 +262,79 @@ def create_image(path: str, block_count: int = DEFAULT_BLOCK_COUNT) -> DiskImage
         块 192..255 空洞
 
     块数不足时按 1/4 比例划分，保证三类块都存在。
-    镜像已存在且容量正确时直接复用，保证重启后原盘与已打的洞都保留。
     """
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    if os.path.exists(path) and os.path.getsize(path) == block_count * BLOCK_SIZE:
-        return DiskImage(path, block_count)
+    os.ftruncate(fd, block_count * BLOCK_SIZE)  # 先全是空洞
+    quarter = max(1, block_count // 4)
+    zero_start, zero_end = quarter, quarter * 2
+    data_start, data_end = quarter * 2, quarter * 3
 
-    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
+    # 写过的零块：显式写 4KiB 零，文件系统会分配宿主块
+    for i in range(zero_start, zero_end):
+        os.pwrite(fd, b"\x00" * BLOCK_SIZE, i * BLOCK_SIZE)
+    # 非零块：写入带块号的可辨识图案
+    for i in range(data_start, min(data_end, block_count)):
+        marker = f"block-{i:04d}\n".encode()
+        payload = (marker + b"\xaa" * BLOCK_SIZE)[:BLOCK_SIZE]
+        os.pwrite(fd, payload, i * BLOCK_SIZE)
+    os.fsync(fd)
+
+
+def _fsync_dir(dir_path: str) -> None:
+    """fsync 目录本身，保证 rename 结果落盘（宿主掉电也不丢镜像）。"""
+    dir_fd = os.open(dir_path, os.O_RDONLY)
     try:
-        os.ftruncate(fd, block_count * BLOCK_SIZE)  # 先全是空洞
-        quarter = max(1, block_count // 4)
-        zero_start, zero_end = quarter, quarter * 2
-        data_start, data_end = quarter * 2, quarter * 3
-
-        # 写过的零块：显式写 4KiB 零，文件系统会分配宿主块
-        for i in range(zero_start, zero_end):
-            os.pwrite(fd, b"\x00" * BLOCK_SIZE, i * BLOCK_SIZE)
-        # 非零块：写入带块号的可辨识图案
-        for i in range(data_start, min(data_end, block_count)):
-            marker = f"block-{i:04d}\n".encode()
-            payload = (marker + b"\xaa" * BLOCK_SIZE)[:BLOCK_SIZE]
-            os.pwrite(fd, payload, i * BLOCK_SIZE)
-        os.fsync(fd)
+        os.fsync(dir_fd)
     finally:
-        os.close(fd)
-    return DiskImage(path, block_count)
+        os.close(dir_fd)
+
+
+def create_image(path: str, block_count: int = DEFAULT_BLOCK_COUNT) -> DiskImage:
+    """创建（或打开已有的）预置 raw 镜像。
+
+    启动流程保证：
+
+    * **容量相符即复用**：已有镜像容量与 ``block_count`` 一致时原样打开，
+      原盘内容与已打的洞全部保留。
+    * **容量不符即停止**：抛出 :class:`ImageCapacityMismatchError`，
+      报告盘上容量与配置容量，不触碰原盘。
+    * **原子建盘**：预置布局先写入临时文件 ``<path>.build.<pid>``，fsync 后
+      ``rename`` 到正式路径——布局完整前正式镜像不存在，建到一半被强杀
+      也不会把半盘当成好盘；重启后清掉残留临时文件重新建。
+    * **多进程串行**：建盘前对 ``<path>.lock`` 取排他 flock，空卷上同时最多
+      一个进程建盘，卷上预置数据最多占一份；其余进程阻塞等待，待布局
+      完整后直接复用。
+    """
+    abspath = os.path.abspath(path)
+    os.makedirs(os.path.dirname(abspath), exist_ok=True)
+
+    lock_fd = os.open(f"{abspath}.lock", os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)  # 阻塞直到拿到建盘锁
+        _clean_stale_build_files(abspath)
+
+        if os.path.exists(abspath):
+            disk_bytes = os.path.getsize(abspath)
+            if disk_bytes != block_count * BLOCK_SIZE:
+                raise ImageCapacityMismatchError(abspath, disk_bytes, block_count)
+        else:
+            tmp = f"{abspath}.build.{os.getpid()}"
+            try:
+                fd = os.open(tmp, os.O_CREAT | os.O_RDWR | os.O_TRUNC, 0o644)
+                try:
+                    _write_preset_layout(fd, block_count)
+                finally:
+                    os.close(fd)
+                # 原子生效：只有布局完整的镜像才会出现在正式路径上
+                os.rename(tmp, abspath)
+                _fsync_dir(os.path.dirname(abspath))
+            except BaseException:
+                # 建盘失败（含键盘中断）：清掉本次临时文件，不留下半盘
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                raise
+    finally:
+        os.close(lock_fd)  # 关闭即释放 flock
+
+    return DiskImage(abspath, block_count)

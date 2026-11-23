@@ -14,6 +14,10 @@ def create_app(image_path: str | None = None, block_count: int = DEFAULT_BLOCK_C
     image_path = image_path or os.environ.get("IMAGE_PATH", "/data/disk.raw")
     block_count = int(os.environ.get("BLOCK_COUNT", str(block_count)))
 
+    # create_image 在预置布局完整（或复用容量相符的已有盘）后才返回，
+    # 因此网页可用时盘一定可读写/回收；容量不符会抛
+    # ImageCapacityMismatchError 使进程启动失败（容器入口的 init-image
+    # 已先行拦截并给出干净报错），原盘内容与空洞保留不动。
     disk = create_image(image_path, block_count)
     core = ApiCore(disk)
 

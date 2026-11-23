@@ -10,11 +10,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 from wsgiref.simple_server import make_server
 
 from .api import ApiCore, ApiError
 from .constants import DEFAULT_BLOCK_COUNT
-from .disk import create_image
+from .disk import ImageCapacityMismatchError, create_image
 
 _STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 _CONTENT_TYPES = {".html": "text/html; charset=utf-8", ".js": "application/javascript; charset=utf-8"}
@@ -106,7 +107,12 @@ def main() -> None:
     image_path = os.environ.get("IMAGE_PATH", "/data/disk.raw")
     block_count = int(os.environ.get("BLOCK_COUNT", str(DEFAULT_BLOCK_COUNT)))
     port = int(os.environ.get("PORT", "8000"))
-    disk = create_image(image_path, block_count)
+    try:
+        # 布局完整（或复用已有盘）后才开始监听，网页才能读写/回收
+        disk = create_image(image_path, block_count)
+    except ImageCapacityMismatchError as exc:
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(1)
     application = create_wsgi_app(ApiCore(disk))
     print(f"[stdlib] serving on 0.0.0.0:{port}, image={image_path}")
     with make_server("0.0.0.0", port, application) as httpd:
